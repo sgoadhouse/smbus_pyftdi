@@ -1,6 +1,7 @@
-"""smbus2 - A drop-in replacement for smbus-cffi/smbus-python"""
+"""smbus_pyftdi - SMBUS python Library that uses pyFTDI for the low-level I2C transactions and uses the same API as the Python package smbus and smbus2"""
 # The MIT License (MIT)
-# Copyright (c) 2020 Karl-Petter Lindegaard
+# Copyright (c) 2023 Stephen Goadhouse
+# Copyright (c) 2020 Karl-Petter Lindegaard (original smbus2 code) 
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,7 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from .smbus2 import SMBus, i2c_msg, I2cFunc  # noqa: F401
+from .smbus_pyftdi import SMBus, i2c_msg, I2cFunc  # noqa: F401
 
-__version__ = "0.4.3"
+__version__ = "0.1"
 __all__ = ["SMBus", "i2c_msg", "I2cFunc"]

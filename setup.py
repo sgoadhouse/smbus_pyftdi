@@ -25,23 +25,23 @@ def find_version(*file_paths):
 
 
 README = read_file('README.md')
-version = find_version('smbus2', '__init__.py')
+version = find_version('smbus_pyftdi', '__init__.py')
 test_deps = [
     'mock;python_version<"3.3"',
     'nose'
 ]
 
 setup(
-    name="smbus2",
+    name="smbus_pyftdi",
     version=version,
-    author="Karl-Petter Lindegaard",
-    author_email="kp.lindegaard@gmail.com",
-    description="smbus2 is a drop-in replacement for smbus-cffi/smbus-python in pure Python",
+    author="Stephen Goadhouse",
+    author_email="sgoadhouse@gmail.com",
+    description="smbus_pyftdi is a SMBUS python Library that uses pyFTDI for the low-level I2C transactions and uses the same API as the Python package smbus and smbus2",
     license="MIT",
-    keywords=['smbus', 'smbus2', 'python', 'i2c', 'raspberrypi', 'linux'],
-    url="https://github.com/kplindegaard/smbus2",
-    packages=['smbus2'],
-    package_data={'smbus2': ['py.typed', 'smbus2.pyi']},
+    keywords=['smbus', 'pyftdi', 'ftdi', 'python', 'i2c', 'pmbus'],
+    url="https://github.com/sgoadhouse/smbus_pyftdi",
+    packages=['smbus_pyftdi'],
+    package_data={'smbus_pyftdi': ['py.typed', 'smbus_pyftdi.pyi']},
     long_description=README,
     long_description_content_type="text/markdown",
     extras_require={
