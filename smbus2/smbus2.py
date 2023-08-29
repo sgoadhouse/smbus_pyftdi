@@ -1,6 +1,7 @@
-"""smbus2 - A drop-in replacement for smbus-cffi/smbus-python"""
+"""smbus_pyftdi - SMBUS python Library that uses pyFTDI for the low-level I2C transactions and uses the same API as the Python package smbus and smbus2"""
 # The MIT License (MIT)
-# Copyright (c) 2020 Karl-Petter Lindegaard
+# Copyright (c) 2023 Stephen Goadhouse
+# Copyright (c) 2020 Karl-Petter Lindegaard (original smbus2 code) 
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +23,6 @@
 
 import os
 import sys
-from fcntl import ioctl
 from ctypes import c_uint32, c_uint8, c_uint16, c_char, POINTER, Structure, Array, Union, create_string_buffer, string_at
 
 
@@ -267,14 +267,14 @@ class SMBus(object):
         Initialize and (optionally) open an i2c bus connection.
 
         :param bus: i2c bus number (e.g. 0 or 1)
-            or an absolute file path (e.g. `/dev/i2c-42`).
+            or a pyFTDI URL (e.g. `ftdi://ftdi:232h/1`).
             If not given, a subsequent  call to ``open()`` is required.
         :type bus: int or str
         :param force: force using the slave address even when driver is
             already using it.
         :type force: boolean
         """
-        self.fd = None
+        self.i2c = None
         self.funcs = I2cFunc(0)
         if bus is not None:
             self.open(bus)
@@ -296,27 +296,32 @@ class SMBus(object):
         Open a given i2c bus.
 
         :param bus: i2c bus number (e.g. 0 or 1)
-            or an absolute file path (e.g. '/dev/i2c-42').
+            or a pyFTDI URL (e.g. `ftdi://ftdi:232h/1`).
         :type bus: int or str
         :raise TypeError: if type(bus) is not in (int, str)
         """
         if isinstance(bus, int):
-            filepath = "/dev/i2c-{}".format(bus)
+            ftdiURL = "ftdi:///{}".format(bus)
         elif isinstance(bus, str):
-            filepath = bus
+            ftdiURL = bus
         else:
             raise TypeError("Unexpected type(bus)={}".format(type(bus)))
 
-        self.fd = os.open(filepath, os.O_RDWR)
+        # Instantiate an I2C controller
+        self.i2c = I2cController()
+
+        # Configure the FTDI device named by ftdiURL as an I2C master
+        self.i2c.configure(ftdiURL)
+
         self.funcs = self._get_funcs()
 
     def close(self):
         """
         Close the i2c connection.
         """
-        if self.fd:
-            os.close(self.fd)
-            self.fd = None
+        if self.i2c:
+            self.i2c.close()
+            self.i2c = None
             self._pec = 0
 
     def _get_pec(self):
@@ -332,7 +337,7 @@ class SMBus(object):
         if not (self.funcs & I2cFunc.SMBUS_PEC):
             raise IOError('SMBUS_PEC is not a feature')
         self._pec = int(enable)
-        ioctl(self.fd, I2C_PEC, self._pec)
+        ioctl(self.i2c, I2C_PEC, self._pec)
 
     pec = property(_get_pec, enable_pec)  # Drop-in replacement for smbus member "pec"
     """Get and set SMBus PEC. 0 = disabled (default), 1 = enabled."""
@@ -349,9 +354,9 @@ class SMBus(object):
         force = force if force is not None else self.force
         if self.address != address or self._force_last != force:
             if force is True:
-                ioctl(self.fd, I2C_SLAVE_FORCE, address)
+                ioctl(self.i2c, I2C_SLAVE_FORCE, address)
             else:
-                ioctl(self.fd, I2C_SLAVE, address)
+                ioctl(self.i2c, I2C_SLAVE, address)
             self.address = address
             self._force_last = force
 
@@ -362,7 +367,36 @@ class SMBus(object):
         :rtype: int
         """
         f = c_uint32()
-        ioctl(self.fd, I2C_FUNCS, f)
+        # create the f word statically since not using ioctl()
+        f = I2cFunc.SMBUS_PEC |
+        I2cFunc.I2C |
+        I2cFunc.ADDR_10BIT |
+        I2cFunc.PROTOCOL_MANGLING | # I2C_M_IGNORE_NAK etc.
+        I2cFunc.SMBUS_PEC |
+        I2cFunc.NOSTART |           # I2C_M_NOSTART
+        I2cFunc.SLAVE |
+        I2cFunc.SMBUS_BLOCK_PROC_CALL |  # SMBus 2.0
+        I2cFunc.SMBUS_QUICK |
+        I2cFunc.SMBUS_READ_BYTE |
+        I2cFunc.SMBUS_WRITE_BYTE |
+        I2cFunc.SMBUS_READ_BYTE_DATA |
+        I2cFunc.SMBUS_WRITE_BYTE_DATA |
+        I2cFunc.SMBUS_READ_WORD_DATA |
+        I2cFunc.SMBUS_WRITE_WORD_DATA |
+        I2cFunc.SMBUS_PROC_CALL |
+        I2cFunc.SMBUS_READ_BLOCK_DATA |
+        I2cFunc.SMBUS_WRITE_BLOCK_DATA |
+        I2cFunc.SMBUS_READ_I2C_BLOCK |    # I2C-like block xfer
+        I2cFunc.SMBUS_WRITE_I2C_BLOCK |   # w/ 1-byte reg. addr.
+        I2cFunc.SMBUS_HOST_NOTIFY |
+
+        I2cFunc.SMBUS_BYTE |
+        I2cFunc.SMBUS_BYTE_DATA |
+        I2cFunc.SMBUS_WORD_DATA |
+        I2cFunc.SMBUS_BLOCK_DATA |
+        I2cFunc.SMBUS_I2C_BLOCK |
+        I2cFunc.SMBUS_EMUL |
+        
         return f.value
 
     def write_quick(self, i2c_addr, force=None):
@@ -376,7 +410,7 @@ class SMBus(object):
         self._set_address(i2c_addr, force=force)
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=0, size=I2C_SMBUS_QUICK)
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
 
     def read_byte(self, i2c_addr, force=None):
         """
@@ -393,7 +427,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=0, size=I2C_SMBUS_BYTE
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.byte
 
     def write_byte(self, i2c_addr, value, force=None):
@@ -411,7 +445,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=value, size=I2C_SMBUS_BYTE
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
 
     def read_byte_data(self, i2c_addr, register, force=None):
         """
@@ -430,7 +464,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_BYTE_DATA
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.byte
 
     def write_byte_data(self, i2c_addr, register, value, force=None):
@@ -452,7 +486,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_BYTE_DATA
         )
         msg.data.contents.byte = value
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
 
     def read_word_data(self, i2c_addr, register, force=None):
         """
@@ -471,7 +505,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_WORD_DATA
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.word
 
     def write_word_data(self, i2c_addr, register, value, force=None):
@@ -493,7 +527,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_WORD_DATA
         )
         msg.data.contents.word = value
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
 
     def process_call(self, i2c_addr, register, value, force=None):
         """
@@ -514,7 +548,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_PROC_CALL
         )
         msg.data.contents.word = value
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.word
 
     def read_block_data(self, i2c_addr, register, force=None):
@@ -534,7 +568,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_BLOCK_DATA
         )
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         length = msg.data.contents.block[0]
         return msg.data.contents.block[1:length + 1]
 
@@ -561,7 +595,7 @@ class SMBus(object):
         )
         msg.data.contents.block[0] = length
         msg.data.contents.block[1:length + 1] = data
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
 
     def block_process_call(self, i2c_addr, register, data, force=None):
         """
@@ -588,7 +622,7 @@ class SMBus(object):
         )
         msg.data.contents.block[0] = length
         msg.data.contents.block[1:length + 1] = data
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         length = msg.data.contents.block[0]
         return msg.data.contents.block[1:length + 1]
 
@@ -614,7 +648,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_I2C_BLOCK_DATA
         )
         msg.data.contents.byte = length
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.block[1:length + 1]
 
     def write_i2c_block_data(self, i2c_addr, register, data, force=None):
@@ -640,7 +674,7 @@ class SMBus(object):
         )
         msg.data.contents.block[0] = length
         msg.data.contents.block[1:length + 1] = data
-        ioctl(self.fd, I2C_SMBUS, msg)
+        ioctl(self.i2c, I2C_SMBUS, msg)
 
     def i2c_rdwr(self, *i2c_msgs):
         """
@@ -655,4 +689,4 @@ class SMBus(object):
         :rtype: None
         """
         ioctl_data = i2c_rdwr_ioctl_data.create(*i2c_msgs)
-        ioctl(self.fd, I2C_RDWR, ioctl_data)
+        ioctl(self.i2c, I2C_RDWR, ioctl_data)
