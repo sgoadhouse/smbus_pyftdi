@@ -23,6 +23,10 @@
 
 import os
 import sys
+import crcmod
+from pyftdi import FtdiLogger
+from pyftdi.i2c import I2cController, I2cIOError, I2cNackError
+from pyftdi.misc import hexdump
 from ctypes import c_uint32, c_uint8, c_uint16, c_char, POINTER, Structure, Array, Union, create_string_buffer, string_at
 
 
@@ -275,6 +279,7 @@ class SMBus(object):
         :type force: boolean
         """
         self.i2c = None
+        self.port = None
         self.funcs = I2cFunc(0)
         if bus is not None:
             self.open(bus)
@@ -282,6 +287,7 @@ class SMBus(object):
         self.force = force
         self._force_last = None
         self._pec = 0
+        self.CRC = None
 
     def __enter__(self):
         """Enter handler."""
@@ -322,7 +328,9 @@ class SMBus(object):
         if self.i2c:
             self.i2c.close()
             self.i2c = None
+            self.port = None
             self._pec = 0
+            self.CRC = None
 
     def _get_pec(self):
         return self._pec
@@ -337,28 +345,35 @@ class SMBus(object):
         if not (self.funcs & I2cFunc.SMBUS_PEC):
             raise IOError('SMBUS_PEC is not a feature')
         self._pec = int(enable)
-        ioctl(self.i2c, I2C_PEC, self._pec)
+        if enable:
+            # if enabling PEC, create the CRC function
+            self.CRC = crcmod.mkCrcFun(
+                poly=0b100000111,
+                initCrc=0,
+                rev=False,
+                xorOut=0
+            )
+
 
     pec = property(_get_pec, enable_pec)  # Drop-in replacement for smbus member "pec"
     """Get and set SMBus PEC. 0 = disabled (default), 1 = enabled."""
 
     def _set_address(self, address, force=None):
         """
-        Set i2c slave address to use for subsequent calls.
+        Set i2c slave address and open I2C port to use for subsequent calls.
 
         :param address:
         :type address: int
         :param force:
         :type force: Boolean
         """
+        #@@@# force was used before when issuing I2C_SLAVE_FORCE
+        #@@@# command through ioctl but means nothing for pyFTDI
         force = force if force is not None else self.force
         if self.address != address or self._force_last != force:
-            if force is True:
-                ioctl(self.i2c, I2C_SLAVE_FORCE, address)
-            else:
-                ioctl(self.i2c, I2C_SLAVE, address)
             self.address = address
             self._force_last = force
+            self.port = self.i2c.get_port(self.address)
 
     def _get_funcs(self):
         """
@@ -368,37 +383,189 @@ class SMBus(object):
         """
         f = c_uint32()
         # create the f word statically since not using ioctl()
-        f = I2cFunc.SMBUS_PEC |
-        I2cFunc.I2C |
-        I2cFunc.ADDR_10BIT |
-        I2cFunc.PROTOCOL_MANGLING | # I2C_M_IGNORE_NAK etc.
-        I2cFunc.SMBUS_PEC |
-        I2cFunc.NOSTART |           # I2C_M_NOSTART
-        I2cFunc.SLAVE |
-        I2cFunc.SMBUS_BLOCK_PROC_CALL |  # SMBus 2.0
-        I2cFunc.SMBUS_QUICK |
-        I2cFunc.SMBUS_READ_BYTE |
-        I2cFunc.SMBUS_WRITE_BYTE |
-        I2cFunc.SMBUS_READ_BYTE_DATA |
-        I2cFunc.SMBUS_WRITE_BYTE_DATA |
-        I2cFunc.SMBUS_READ_WORD_DATA |
-        I2cFunc.SMBUS_WRITE_WORD_DATA |
-        I2cFunc.SMBUS_PROC_CALL |
-        I2cFunc.SMBUS_READ_BLOCK_DATA |
-        I2cFunc.SMBUS_WRITE_BLOCK_DATA |
-        I2cFunc.SMBUS_READ_I2C_BLOCK |    # I2C-like block xfer
-        I2cFunc.SMBUS_WRITE_I2C_BLOCK |   # w/ 1-byte reg. addr.
-        I2cFunc.SMBUS_HOST_NOTIFY |
+        #@@@# Come back later to determine which options to disable
+        f = (I2cFunc.I2C |
+             I2cFunc.ADDR_10BIT |
+             I2cFunc.PROTOCOL_MANGLING | # I2C_M_IGNORE_NAK etc.
+             #I2cFunc.SMBUS_PEC |  #@@@# Enable after implement it
+             I2cFunc.NOSTART |           # I2C_M_NOSTART
+             I2cFunc.SLAVE |
+             I2cFunc.SMBUS_BLOCK_PROC_CALL |  # SMBus 2.0
+             I2cFunc.SMBUS_QUICK |
+             I2cFunc.SMBUS_READ_BYTE |
+             I2cFunc.SMBUS_WRITE_BYTE |
+             I2cFunc.SMBUS_READ_BYTE_DATA |
+             I2cFunc.SMBUS_WRITE_BYTE_DATA |
+             I2cFunc.SMBUS_READ_WORD_DATA |
+             I2cFunc.SMBUS_WRITE_WORD_DATA |
+             I2cFunc.SMBUS_PROC_CALL |
+             I2cFunc.SMBUS_READ_BLOCK_DATA |
+             I2cFunc.SMBUS_WRITE_BLOCK_DATA |
+             I2cFunc.SMBUS_READ_I2C_BLOCK |    # I2C-like block xfer
+             I2cFunc.SMBUS_WRITE_I2C_BLOCK |   # w/ 1-byte reg. addr.
+             I2cFunc.SMBUS_HOST_NOTIFY |
 
-        I2cFunc.SMBUS_BYTE |
-        I2cFunc.SMBUS_BYTE_DATA |
-        I2cFunc.SMBUS_WORD_DATA |
-        I2cFunc.SMBUS_BLOCK_DATA |
-        I2cFunc.SMBUS_I2C_BLOCK |
-        I2cFunc.SMBUS_EMUL |
+             I2cFunc.SMBUS_BYTE |
+             I2cFunc.SMBUS_BYTE_DATA |
+             I2cFunc.SMBUS_WORD_DATA |
+             I2cFunc.SMBUS_BLOCK_DATA |
+             I2cFunc.SMBUS_I2C_BLOCK |
+             I2cFunc.SMBUS_EMUL)
         
         return f.value
 
+    def wr_pec(self, send):
+        """
+        Return the PEC CRC over the send data, if self.pec is
+        enabled, otherwise return an empty array of bytes
+
+        :param send: array of bytes for payload SMBUS message to write
+        :type send: bytes
+        :return: PEC
+        :rtype: bytes
+
+        """
+        if self.pec:
+            addr = ((self.port.address << 1) | I2C_SMBUS_WRITE).to_bytes(1,'little')
+            pec = self.CRC(addr+send).to_bytes(1,'little')
+        else:
+            pec = b''
+
+        return pec
+
+    def rd_pec(self, send, recv):
+        """
+        Compute the PEC CRC over the send & recv data and check
+        against what was receive, if self.pec is enabled, otherwise
+        return an empty array of bytes
+
+        :param send: array of bytes for payload SMBUS message to write
+        :type send: bytes
+        :param recv: array of bytes received from SMBUS read - includes PEC
+        :type recv: bytes
+
+        """
+        if self.pec:
+            # if length of send is 0, then do add include the wr_addr in CRC data bytes
+            if len(send) > 0:
+                wr_addr = ((self.port.address << 1) | I2C_SMBUS_WRITE).to_bytes(1,'little')
+            else:
+                wr_addr = b''
+            rd_addr = ((self.port.address << 1) | I2C_SMBUS_READ).to_bytes(1,'little')
+            pec = self.CRC(wr_addr+send+rd_addr+recv)
+            
+            ## CRC that includes a correct PEC byte results in 0
+            if pec != 0:
+                raise IOError(f'ioctl() I2C_SMBUS_READ: PEC Mismatch!')
+
+            
+    def ioctl(self, ftdiI2C, command, msg):
+        """
+        Since all functions call ioctl, to redirect through
+        pyFTDI, create an ioctl() method with the same interface but
+        handle transactions through pyFTDI.
+
+        :param ftdiI2C: pyFTDI I2C Controller object
+        :type ftdiI2C: I2cController
+        :param command: ioctl() command
+        :type command: int
+        :param msg: ioctl() message structure
+        :type msg: i2c_smbus_ioctl_data
+        """
+
+        if command == I2C_SMBUS:
+            ## Handle SMBUS transfer
+            if msg.read_write == I2C_SMBUS_WRITE:
+                ## Handle SMBUS Write
+                if msg.size == I2C_SMBUS_QUICK:
+                    ## SMBus Quick Command : A SMBUS Quick Write is
+                    ## simply sending the Address followed by the
+                    ## Write bit.  
+                    ##
+                    ## NOTE: No version that uses PEC
+                    self.port.write(b'')
+                elif msg.size == I2C_SMBUS_BYTE:
+                    ## SMBus Send Byte: No register given, so simply write a byte
+                    data = msg.command.to_bytes(1,'little')
+                    pec = self.wr_pec(data)
+                    self.port.write(data+pec)
+                elif msg.size == I2C_SMBUS_BYTE_DATA:
+                    ## SMBus Write Byte: Write a byte to given register passed in msg.command
+                    data = msg.command.to_bytes(1,'little') + msg.data.contents.byte.to_bytes(1,'little')
+                    pec = self.wr_pec(data)
+                    self.port.write(data+pec)
+                elif msg.size == I2C_SMBUS_WORD_DATA:
+                    ## SMBus Write Word: Write a 16-bit word to given register passed in msg.command
+                    data = msg.command.to_bytes(1,'little') + msg.data.contents.word.to_bytes(2,'little')
+                    pec = self.wr_pec(data)
+                    self.port.write(data+pec)
+                elif msg.size == I2C_SMBUS_PROC_CALL:
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_WRITE: unsupported size identifier: I2C_SMBUS_PROC_CALL')        
+                elif msg.size == I2C_SMBUS_BLOCK_DATA:
+                    # This isn't supported by Pure-I2C drivers with SMBUS emulation, like those in RaspberryPi, OrangePi, etc :(
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_WRITE: unsupported size identifier: I2C_SMBUS_BLOCK_DATA')        
+                elif msg.size == I2C_SMBUS_BLOCK_PROC_CALL:
+                    # Like I2C_SMBUS_BLOCK_DATA, it isn't supported by Pure-I2C drivers either.
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_WRITE: unsupported size identifier: I2C_SMBUS_BLOCK_PROC_CALL')        
+                elif msg.size == I2C_SMBUS_I2C_BLOCK_DATA:
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_WRITE: unsupported size identifier: I2C_SMBUS_I2C_BLOCK_DATA')        
+                else:
+                    raise IOError(f'ioctl() I2C_SMBUS command: unknown I2C_SMBUS_WRITE size identifier: {msg.size}')        
+                
+            elif msg.read_write == I2C_SMBUS_READ:
+                ## Handle SMBUS Read
+                if msg.size == I2C_SMBUS_QUICK:
+                    ## SMBus Quick Command : A SMBUS Quick Read is
+                    ## simply sending the Address followed by the
+                    ## Read bit.  read() with no parameters
+                    ## defaults to this.
+                    ##
+                    ## NOTE: No version that uses PEC
+                    self.port.read()
+                elif msg.size == I2C_SMBUS_BYTE:
+                    ## SMBus Receive Byte: No register given, so simply read a byte
+                    rdlen = 1
+                    data = self.port.read(rdlen+(1 if self.pec else 0))
+                    self.rd_pec(b'',data)
+                    # return data through msg which is actually a POINTER
+                    msg.data.contents.byte = int.from_bytes(data[:rdlen],'little')
+                elif msg.size == I2C_SMBUS_BYTE_DATA:
+                    ## SMBus Read Byte: Read a byte from a given register passed in msg.command
+                    rdlen = 1
+                    send = msg.command.to_bytes(1,'little')
+                    recv = self.port.exchange(send,rdlen+(1 if self.pec else 0))
+                    self.rd_pec(send,recv)
+                    # return data through msg which is actually a POINTER
+                    msg.data.contents.byte = int.from_bytes(recv[:rdlen],'little')
+                elif msg.size == I2C_SMBUS_WORD_DATA:
+                    ## SMBus Read Word: Read a 16-bit word from a given register passed in msg.command
+                    rdlen = 2
+                    send = msg.command.to_bytes(1,'little')
+                    recv = self.port.exchange(send,rdlen+(1 if self.pec else 0))
+                    self.rd_pec(send,recv)
+                    # return data through msg which is actually a POINTER
+                    msg.data.contents.word = int.from_bytes(recv[:rdlen],'little')
+                elif msg.size == I2C_SMBUS_PROC_CALL:
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_READ: unsupported size identifier: I2C_SMBUS_PROC_CALL')        
+                elif msg.size == I2C_SMBUS_BLOCK_DATA:
+                    # This isn't supported by Pure-I2C drivers with SMBUS emulation, like those in RaspberryPi, OrangePi, etc :(
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_READ: unsupported size identifier: I2C_SMBUS_BLOCK_DATA')        
+                elif msg.size == I2C_SMBUS_BLOCK_PROC_CALL:
+                    # Like I2C_SMBUS_BLOCK_DATA, it isn't supported by Pure-I2C drivers either.
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_READ: unsupported size identifier: I2C_SMBUS_BLOCK_PROC_CALL')        
+                elif msg.size == I2C_SMBUS_I2C_BLOCK_DATA:
+                    raise IOError(f'ioctl() I2C_SMBUS command: I2C_SMBUS_READ: unsupported size identifier: I2C_SMBUS_I2C_BLOCK_DATA')        
+                else:
+                    raise IOError(f'ioctl() I2C_SMBUS command: unknown I2C_SMBUS_READ size identifier: {msg.size}')        
+
+            else:
+                raise IOError(f'ioctl() I2C_SMBUS command: unknown read_write value: {msg.read_write}')
+        elif command == I2C_RDWR:
+            ## Handle I2C Read/Write transfer
+            raise IOError(f'ioctl command "{command}" is not supported, yet')
+        else:
+            raise IOError(f'ioctl command "{command}" is not supported')
+        
     def write_quick(self, i2c_addr, force=None):
         """
         Perform quick transaction. Throws IOError if unsuccessful.
@@ -410,7 +577,7 @@ class SMBus(object):
         self._set_address(i2c_addr, force=force)
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=0, size=I2C_SMBUS_QUICK)
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
 
     def read_byte(self, i2c_addr, force=None):
         """
@@ -427,7 +594,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=0, size=I2C_SMBUS_BYTE
         )
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.byte
 
     def write_byte(self, i2c_addr, value, force=None):
@@ -445,7 +612,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_WRITE, command=value, size=I2C_SMBUS_BYTE
         )
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
 
     def read_byte_data(self, i2c_addr, register, force=None):
         """
@@ -464,7 +631,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_BYTE_DATA
         )
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.byte
 
     def write_byte_data(self, i2c_addr, register, value, force=None):
@@ -486,7 +653,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_BYTE_DATA
         )
         msg.data.contents.byte = value
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
 
     def read_word_data(self, i2c_addr, register, force=None):
         """
@@ -505,7 +672,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_WORD_DATA
         )
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.word
 
     def write_word_data(self, i2c_addr, register, value, force=None):
@@ -527,7 +694,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_WORD_DATA
         )
         msg.data.contents.word = value
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
 
     def process_call(self, i2c_addr, register, value, force=None):
         """
@@ -548,7 +715,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_WRITE, command=register, size=I2C_SMBUS_PROC_CALL
         )
         msg.data.contents.word = value
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.word
 
     def read_block_data(self, i2c_addr, register, force=None):
@@ -568,7 +735,7 @@ class SMBus(object):
         msg = i2c_smbus_ioctl_data.create(
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_BLOCK_DATA
         )
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         length = msg.data.contents.block[0]
         return msg.data.contents.block[1:length + 1]
 
@@ -595,7 +762,7 @@ class SMBus(object):
         )
         msg.data.contents.block[0] = length
         msg.data.contents.block[1:length + 1] = data
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
 
     def block_process_call(self, i2c_addr, register, data, force=None):
         """
@@ -622,7 +789,7 @@ class SMBus(object):
         )
         msg.data.contents.block[0] = length
         msg.data.contents.block[1:length + 1] = data
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         length = msg.data.contents.block[0]
         return msg.data.contents.block[1:length + 1]
 
@@ -648,7 +815,7 @@ class SMBus(object):
             read_write=I2C_SMBUS_READ, command=register, size=I2C_SMBUS_I2C_BLOCK_DATA
         )
         msg.data.contents.byte = length
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
         return msg.data.contents.block[1:length + 1]
 
     def write_i2c_block_data(self, i2c_addr, register, data, force=None):
@@ -674,7 +841,7 @@ class SMBus(object):
         )
         msg.data.contents.block[0] = length
         msg.data.contents.block[1:length + 1] = data
-        ioctl(self.i2c, I2C_SMBUS, msg)
+        self.ioctl(self.i2c, I2C_SMBUS, msg)
 
     def i2c_rdwr(self, *i2c_msgs):
         """
@@ -689,4 +856,36 @@ class SMBus(object):
         :rtype: None
         """
         ioctl_data = i2c_rdwr_ioctl_data.create(*i2c_msgs)
-        ioctl(self.i2c, I2C_RDWR, ioctl_data)
+        self.ioctl(self.i2c, I2C_RDWR, ioctl_data)
+
+if __name__ == '__main__':
+    ## Test a few things by executing this file with python
+
+    ftdi_url = 'ftdi://ftdi:4232h/1'
+    device = 0x32
+    
+    with SMBus(ftdi_url) as bus:
+        bus.enable_pec(False)
+        # Test writing TON_DELAY
+        vin = bus.read_word_data(device, 0x88)
+        vout = bus.read_word_data(device, 0x8B)
+        print(f"W/O PEC: VIN: {vin:04X}  VOUT: {vout:04X}")
+
+        bus.write_word_data(device, 0x60, 1)
+        ton_delay1 = bus.read_word_data(device, 0x60)
+        bus.write_word_data(device, 0x60, 0)
+        ton_delay0 = bus.read_word_data(device, 0x60)
+        print(f"W/O PEC: TON_DELAY: {ton_delay1:04X} >> {ton_delay0:04X}")
+
+    with SMBus(ftdi_url) as bus:
+        bus.enable_pec(True)
+        vin = bus.read_word_data(device, 0x88)
+        vout = bus.read_word_data(device, 0x8B)
+        print(f"W/  PEC: VIN: {vin:04X}  VOUT: {vout:04X}")
+
+        bus.write_word_data(device, 0x60, 1)
+        ton_delay1 = bus.read_word_data(device, 0x60)
+        bus.write_word_data(device, 0x60, 0)
+        ton_delay0 = bus.read_word_data(device, 0x60)
+        print(f"W/  PEC: TON_DELAY: {ton_delay1:04X} >> {ton_delay0:04X}")
+        
